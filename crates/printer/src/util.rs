@@ -420,9 +420,9 @@ where
     // and learn. Abstraction boundaries are hard.
     let is_multi_line = searcher.multi_line_with_matcher(&matcher);
     if is_multi_line {
-        if bytes[range.end..].len() >= MAX_LOOK_AHEAD {
-            bytes = &bytes[..range.end + MAX_LOOK_AHEAD];
-        }
+        // if bytes[range.end..].len() >= MAX_LOOK_AHEAD {
+        //     bytes = &bytes[..range.end + MAX_LOOK_AHEAD];
+        // }
     } else {
         // When searching a single line, we should remove the line terminator.
         // Otherwise, it's possible for the regex (via look-around) to observe

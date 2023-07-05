@@ -1323,6 +1323,10 @@ impl WalkParallel {
             self.threads
         }
     }
+
+    pub fn ignore(&self) -> Ignore {
+        self.ig_root.clone()
+    }
 }
 
 /// Message is the set of instructions that a worker knows how to process.
@@ -1578,7 +1582,7 @@ impl<'s> Worker<'s> {
         // N.B. See analogous call in the single-threaded implementation about
         // why it's important for this to come before the checks below.
         let (should_skip, match_metadata_token) =
-            should_skip_entry_with_match_metadata_token(ig, &dent);
+            ig.should_skip_entry_with_match_metadata_token(&dent);
         if should_skip {
             return WalkState::Continue;
         }
@@ -1761,31 +1765,7 @@ fn skip_filesize(
 }
 
 fn should_skip_entry(ig: &Ignore, dent: &DirEntry) -> bool {
-    should_skip_entry_with_match_metadata_token(ig, dent).0
-}
-
-fn should_skip_entry_with_match_metadata_token(
-    ig: &Ignore,
-    dent: &DirEntry,
-) -> (bool, Option<MatchMetadataToken>) {
-    let m = ig.matched_dir_entry(dent);
-    if m.is_ignore() {
-        log::debug!("ignoring {}: {:?}", dent.path().display(), m);
-        (
-            true,
-            m.inner()
-                .and_then(|ignore_match| ignore_match.match_metadata_token()),
-        )
-    } else if m.is_whitelist() {
-        log::debug!("whitelisting {}: {:?}", dent.path().display(), m);
-        (
-            false,
-            m.inner()
-                .and_then(|ignore_match| ignore_match.match_metadata_token()),
-        )
-    } else {
-        (false, None)
-    }
+    ig.should_skip_entry_with_match_metadata_token(dent).0
 }
 
 /// Returns a handle to stdout for filtering search.

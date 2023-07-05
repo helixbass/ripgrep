@@ -535,6 +535,32 @@ impl Ignore {
     ) -> &FileTypeDef {
         self.0.types.get_file_type_def_at_selection_index(selection_index)
     }
+
+    pub fn should_skip_entry_with_match_metadata_token(
+        &self,
+        dent: &DirEntry,
+    ) -> (bool, Option<MatchMetadataToken>) {
+        let m = self.matched_dir_entry(dent);
+        if m.is_ignore() {
+            log::debug!("ignoring {}: {:?}", dent.path().display(), m);
+            (
+                true,
+                m.inner().and_then(|ignore_match| {
+                    ignore_match.match_metadata_token()
+                }),
+            )
+        } else if m.is_whitelist() {
+            log::debug!("whitelisting {}: {:?}", dent.path().display(), m);
+            (
+                false,
+                m.inner().and_then(|ignore_match| {
+                    ignore_match.match_metadata_token()
+                }),
+            )
+        } else {
+            (false, None)
+        }
+    }
 }
 
 pub struct MatchMetadata<'a> {

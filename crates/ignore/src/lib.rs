@@ -44,8 +44,6 @@ for result in WalkBuilder::new("./").hidden(false).build() {
 See the documentation for `WalkBuilder` for many other options.
 */
 
-#![deny(missing_docs)]
-
 use std::error;
 use std::fmt;
 use std::io;

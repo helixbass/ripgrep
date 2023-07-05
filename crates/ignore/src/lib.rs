@@ -49,6 +49,7 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
+pub use crate::dir::MatchMetadata;
 pub use crate::walk::{
     DirEntry, ParallelVisitor, ParallelVisitorBuilder, Walk, WalkBuilder,
     WalkParallel, WalkState,

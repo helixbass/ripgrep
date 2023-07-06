@@ -260,6 +260,7 @@ pub const DEFAULT_TYPES: &[(&str, &[&str])] = &[
     ]),
     ("thrift", &["*.thrift"]),
     ("toml", &["*.toml", "Cargo.lock"]),
+    ("treesitterquery", &["*.scm"]),
     ("ts", &["*.ts", "*.tsx", "*.cts", "*.mts"]),
     ("twig", &["*.twig"]),
     ("txt", &["*.txt"]),

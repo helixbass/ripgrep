@@ -23,7 +23,9 @@ use std::sync::{Arc, RwLock};
 use crate::gitignore::{self, Gitignore, GitignoreBuilder};
 use crate::overrides::{self, Override};
 use crate::pathutil::{is_hidden, strip_prefix};
-use crate::types::{self, Types};
+use crate::types::{
+    self, FileTypeDef, FileTypeIndicesTokenIterator, MatchMetadataToken, Types,
+};
 use crate::walk::DirEntry;
 use crate::{Error, Match, PartialErrorBuilder};
 
@@ -38,7 +40,7 @@ pub struct IgnoreMatch<'a>(IgnoreMatchInner<'a>);
 enum IgnoreMatchInner<'a> {
     Override(overrides::Glob<'a>),
     Gitignore(&'a gitignore::Glob),
-    Types(types::Glob<'a>),
+    Types(types::Globs),
     Hidden,
 }
 
@@ -51,12 +53,19 @@ impl<'a> IgnoreMatch<'a> {
         IgnoreMatch(IgnoreMatchInner::Gitignore(x))
     }
 
-    fn types(x: types::Glob<'a>) -> IgnoreMatch<'a> {
+    fn types(x: types::Globs) -> IgnoreMatch<'a> {
         IgnoreMatch(IgnoreMatchInner::Types(x))
     }
 
     fn hidden() -> IgnoreMatch<'static> {
         IgnoreMatch(IgnoreMatchInner::Hidden)
+    }
+
+    pub fn match_metadata_token(&self) -> Option<MatchMetadataToken> {
+        match &self.0 {
+            IgnoreMatchInner::Types(globs) => globs.match_metadata_token(),
+            _ => None,
+        }
     }
 }
 
@@ -506,6 +515,86 @@ impl Ignore {
     /// one exists.
     fn absolute_base(&self) -> Option<&Path> {
         self.0.absolute_base.as_ref().map(|p| &***p)
+    }
+
+    pub fn get_match_metadata<'self_>(
+        &'self_ self,
+        match_metadata_token: MatchMetadataToken,
+    ) -> MatchMetadata<'self_> {
+        MatchMetadata {
+            matching_file_types: MatchingFileTypesIterator::new(
+                self,
+                match_metadata_token,
+            ),
+        }
+    }
+
+    pub fn get_file_type_def_at_selection_index(
+        &self,
+        selection_index: usize,
+    ) -> &FileTypeDef {
+        self.0.types.get_file_type_def_at_selection_index(selection_index)
+    }
+
+    pub fn should_skip_entry_with_match_metadata_token(
+        &self,
+        dent: &DirEntry,
+    ) -> (bool, Option<MatchMetadataToken>) {
+        let m = self.matched_dir_entry(dent);
+        if m.is_ignore() {
+            log::debug!("ignoring {}: {:?}", dent.path().display(), m);
+            (
+                true,
+                m.inner().and_then(|ignore_match| {
+                    ignore_match.match_metadata_token()
+                }),
+            )
+        } else if m.is_whitelist() {
+            log::debug!("whitelisting {}: {:?}", dent.path().display(), m);
+            (
+                false,
+                m.inner().and_then(|ignore_match| {
+                    ignore_match.match_metadata_token()
+                }),
+            )
+        } else {
+            (false, None)
+        }
+    }
+}
+
+pub struct MatchMetadata<'a> {
+    pub matching_file_types: MatchingFileTypesIterator<'a>,
+}
+
+pub struct MatchingFileTypesIterator<'a> {
+    ignore: &'a Ignore,
+    file_type_indices_iterator: FileTypeIndicesTokenIterator,
+}
+
+impl<'a> MatchingFileTypesIterator<'a> {
+    pub fn new(
+        ignore: &'a Ignore,
+        match_metadata_token: MatchMetadataToken,
+    ) -> Self {
+        Self {
+            ignore,
+            file_type_indices_iterator: match match_metadata_token {
+                MatchMetadataToken::FileTypeIndicesToken(
+                    file_type_indices_token,
+                ) => file_type_indices_token.into_iter(),
+            },
+        }
+    }
+}
+
+impl<'a> Iterator for MatchingFileTypesIterator<'a> {
+    type Item = &'a FileTypeDef;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.file_type_indices_iterator.next().map(|file_type_index| {
+            self.ignore.get_file_type_def_at_selection_index(file_type_index)
+        })
     }
 }
 

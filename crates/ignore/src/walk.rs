@@ -13,10 +13,10 @@ use std::vec;
 use same_file::Handle;
 use walkdir::{self, WalkDir};
 
-use crate::dir::{Ignore, IgnoreBuilder};
+use crate::dir::{Ignore, IgnoreBuilder, MatchMetadata};
 use crate::gitignore::GitignoreBuilder;
 use crate::overrides::Override;
-use crate::types::Types;
+use crate::types::{MatchMetadataToken, Types};
 use crate::{Error, PartialErrorBuilder};
 
 /// A directory entry with a possible error attached.
@@ -1149,7 +1149,10 @@ impl<'a, 's, P: ParallelVisitorBuilder<'s>> ParallelVisitorBuilder<'s>
 pub trait ParallelVisitor: Send {
     /// Receives files and directories for the current thread. This is called
     /// once for every directory entry visited by traversal.
-    fn visit(&mut self, entry: Result<DirEntry, Error>) -> WalkState;
+    fn visit(
+        &mut self,
+        entry: Result<(DirEntry, Option<MatchMetadata<'_>>), Error>,
+    ) -> WalkState;
 }
 
 struct FnBuilder<F> {
@@ -1165,15 +1168,23 @@ impl<'s, F: FnMut() -> FnVisitor<'s>> ParallelVisitorBuilder<'s>
     }
 }
 
-type FnVisitor<'s> =
-    Box<dyn FnMut(Result<DirEntry, Error>) -> WalkState + Send + 's>;
+type FnVisitor<'s> = Box<
+    dyn FnMut(
+            Result<(DirEntry, Option<MatchMetadata<'_>>), Error>,
+        ) -> WalkState
+        + Send
+        + 's,
+>;
 
 struct FnVisitorImp<'s> {
     visitor: FnVisitor<'s>,
 }
 
 impl<'s> ParallelVisitor for FnVisitorImp<'s> {
-    fn visit(&mut self, entry: Result<DirEntry, Error>) -> WalkState {
+    fn visit(
+        &mut self,
+        entry: Result<(DirEntry, Option<MatchMetadata<'_>>), Error>,
+    ) -> WalkState {
         (self.visitor)(entry)
     }
 }
@@ -1271,6 +1282,7 @@ impl WalkParallel {
                     dent: dent,
                     ignore: self.ig_root.clone(),
                     root_device: root_device,
+                    match_metadata_token: None,
                 }));
             }
             // ... but there's no need to start workers if we don't need them.
@@ -1311,6 +1323,10 @@ impl WalkParallel {
             self.threads
         }
     }
+
+    pub fn ignore(&self) -> Ignore {
+        self.ig_root.clone()
+    }
 }
 
 /// Message is the set of instructions that a worker knows how to process.
@@ -1335,6 +1351,7 @@ struct Work {
     /// The root device number. When present, only files with the same device
     /// number should be considered.
     root_device: Option<u64>,
+    match_metadata_token: Option<MatchMetadataToken>,
 }
 
 impl Work {
@@ -1442,7 +1459,13 @@ impl<'s> Worker<'s> {
         // If the work is not a directory, then we can just execute the
         // caller's callback immediately and move on.
         if work.is_symlink() || !work.is_dir() {
-            return self.visitor.visit(Ok(work.dent));
+            let ignore = work.ignore.clone();
+            return self.visitor.visit(Ok((
+                work.dent,
+                work.match_metadata_token.map(|match_metadata_token| {
+                    ignore.get_match_metadata(match_metadata_token)
+                }),
+            )));
         }
         if let Some(err) = work.add_parents() {
             let state = self.visitor.visit(Err(err));
@@ -1475,7 +1498,7 @@ impl<'s> Worker<'s> {
         // entry before passing the error value.
         let readdir = work.read_dir();
         let depth = work.dent.depth();
-        let state = self.visitor.visit(Ok(work.dent));
+        let state = self.visitor.visit(Ok((work.dent, None)));
         if !state.is_continue() {
             return state;
         }
@@ -1558,7 +1581,9 @@ impl<'s> Worker<'s> {
         }
         // N.B. See analogous call in the single-threaded implementation about
         // why it's important for this to come before the checks below.
-        if should_skip_entry(ig, &dent) {
+        let (should_skip, match_metadata_token) =
+            ig.should_skip_entry_with_match_metadata_token(&dent);
+        if should_skip {
             return WalkState::Continue;
         }
         if let Some(ref stdout) = self.skip {
@@ -1587,7 +1612,12 @@ impl<'s> Worker<'s> {
                 false
             };
         if !should_skip_filesize && !should_skip_filtered {
-            self.send(Work { dent, ignore: ig.clone(), root_device });
+            self.send(Work {
+                dent,
+                ignore: ig.clone(),
+                root_device,
+                match_metadata_token,
+            });
         }
         WalkState::Continue
     }
@@ -1735,16 +1765,7 @@ fn skip_filesize(
 }
 
 fn should_skip_entry(ig: &Ignore, dent: &DirEntry) -> bool {
-    let m = ig.matched_dir_entry(dent);
-    if m.is_ignore() {
-        log::debug!("ignoring {}: {:?}", dent.path().display(), m);
-        true
-    } else if m.is_whitelist() {
-        log::debug!("whitelisting {}: {:?}", dent.path().display(), m);
-        false
-    } else {
-        false
-    }
+    ig.should_skip_entry_with_match_metadata_token(dent).0
 }
 
 /// Returns a handle to stdout for filtering search.

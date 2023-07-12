@@ -86,9 +86,11 @@ assert!(matcher.matched("y.cpp", false).is_whitelist());
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::iter::Enumerate;
 use std::path::Path;
 use std::sync::Arc;
 
+use bitvec::prelude::*;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use regex::Regex;
 use thread_local::ThreadLocal;
@@ -112,32 +114,238 @@ use crate::{Error, Match};
 /// The lifetime `'a` refers to the lifetime of the underlying file type
 /// definition, which corresponds to the lifetime of the file type matcher.
 #[derive(Clone, Debug)]
-pub struct Glob<'a>(GlobInner<'a>);
+pub struct Globs(GlobsInner);
 
 #[derive(Clone, Debug)]
-enum GlobInner<'a> {
+enum GlobsInner {
     /// No glob matched, but the file path should still be ignored.
     UnmatchedIgnore,
     /// A glob matched.
     Matched {
         /// The file type definition which provided the glob.
-        def: &'a FileTypeDef,
+        file_type_indices_token: FileTypeIndicesToken,
     },
 }
 
-impl<'a> Glob<'a> {
-    fn unmatched() -> Glob<'a> {
-        Glob(GlobInner::UnmatchedIgnore)
-    }
-
-    /// Return the file type definition that matched, if one exists. A file type
-    /// definition always exists when a specific definition matches a file
-    /// path.
-    pub fn file_type_def(&self) -> Option<&FileTypeDef> {
-        match self {
-            Glob(GlobInner::UnmatchedIgnore) => None,
-            Glob(GlobInner::Matched { def, .. }) => Some(def),
+impl Globs {
+    pub fn match_metadata_token(&self) -> Option<MatchMetadataToken> {
+        match &self.0 {
+            GlobsInner::Matched { file_type_indices_token } => {
+                Some(MatchMetadataToken::FileTypeIndicesToken(
+                    file_type_indices_token.clone(),
+                ))
+            }
+            _ => None,
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum MatchMetadataToken {
+    FileTypeIndicesToken(FileTypeIndicesToken),
+}
+
+const FILE_TYPE_INDICES_BIT_ARRAY_LEN: usize = 256;
+
+type FileTypeIndicesBitArray = BitArr!(for FILE_TYPE_INDICES_BIT_ARRAY_LEN);
+
+fn bit_array_into_file_type_indices_iterator(
+    bit_array: FileTypeIndicesBitArray,
+) -> FileTypeIndicesBitArrayIterator {
+    FileTypeIndicesBitArrayIterator::new(bit_array)
+}
+
+pub struct FileTypeIndicesBitArrayIterator {
+    bit_array_iterator:
+        Enumerate<<FileTypeIndicesBitArray as IntoIterator>::IntoIter>,
+}
+
+impl FileTypeIndicesBitArrayIterator {
+    pub fn new(bit_array: FileTypeIndicesBitArray) -> Self {
+        Self { bit_array_iterator: bit_array.into_iter().enumerate() }
+    }
+}
+
+impl Iterator for FileTypeIndicesBitArrayIterator {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some((file_type_index, is_selected)) =
+            self.bit_array_iterator.next()
+        {
+            if is_selected {
+                return Some(file_type_index);
+            }
+        }
+        None
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum FileTypeIndicesToken {
+    Empty,
+    Single(usize),
+    BitArray(FileTypeIndicesBitArray),
+    Vec(Vec<usize>),
+}
+
+impl FileTypeIndicesToken {
+    pub fn push(&mut self, file_type_index: usize) {
+        if file_type_index < FILE_TYPE_INDICES_BIT_ARRAY_LEN {
+            match self {
+                Self::Empty => {
+                    *self = Self::Single(file_type_index);
+                }
+                Self::Single(first_file_type_index) => {
+                    let mut bit_array = BitArray::ZERO;
+                    bit_array.set(*first_file_type_index, true);
+                    bit_array.set(file_type_index, true);
+                    *self = Self::BitArray(bit_array);
+                }
+                Self::BitArray(bit_array) => {
+                    bit_array.set(file_type_index, true);
+                }
+                Self::Vec(vec) => {
+                    vec.push(file_type_index);
+                }
+            }
+        } else {
+            match self {
+                Self::Empty => {
+                    *self = Self::Vec(vec![file_type_index]);
+                }
+                Self::Single(first_file_type_index) => {
+                    *self = Self::Vec(vec![
+                        *first_file_type_index,
+                        file_type_index,
+                    ]);
+                }
+                Self::BitArray(bit_array) => {
+                    let mut vec: Vec<_> =
+                        bit_array_into_file_type_indices_iterator(*bit_array)
+                            .collect();
+                    vec.push(file_type_index);
+                    *self = Self::Vec(vec);
+                }
+                Self::Vec(vec) => {
+                    vec.push(file_type_index);
+                }
+            }
+        }
+    }
+}
+
+impl Default for FileTypeIndicesToken {
+    fn default() -> Self {
+        Self::Empty
+    }
+}
+
+impl IntoIterator for FileTypeIndicesToken {
+    type Item = usize;
+
+    type IntoIter = FileTypeIndicesTokenIterator;
+
+    fn into_iter(self) -> Self::IntoIter {
+        FileTypeIndicesTokenIterator::new(self)
+    }
+}
+
+impl<'a> IntoIterator for &'a FileTypeIndicesToken {
+    type Item = usize;
+
+    type IntoIter = FileTypeIndicesTokenRefIterator<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        FileTypeIndicesTokenRefIterator::new(self)
+    }
+}
+
+impl From<usize> for FileTypeIndicesToken {
+    fn from(value: usize) -> Self {
+        Self::Single(value)
+    }
+}
+
+pub enum FileTypeIndicesTokenIterator {
+    Empty,
+    Single(Option<usize>),
+    BitArray(FileTypeIndicesBitArrayIterator),
+    Vec(<Vec<usize> as IntoIterator>::IntoIter),
+}
+
+impl FileTypeIndicesTokenIterator {
+    pub fn new(file_type_indices_token: FileTypeIndicesToken) -> Self {
+        match file_type_indices_token {
+            FileTypeIndicesToken::Empty => Self::Empty,
+            FileTypeIndicesToken::Single(first_file_type_index) => {
+                Self::Single(Some(first_file_type_index))
+            }
+            FileTypeIndicesToken::BitArray(bit_array) => Self::BitArray(
+                bit_array_into_file_type_indices_iterator(bit_array),
+            ),
+            FileTypeIndicesToken::Vec(vec) => Self::Vec(vec.into_iter()),
+        }
+    }
+}
+
+impl Iterator for FileTypeIndicesTokenIterator {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            FileTypeIndicesTokenIterator::Empty => None,
+            FileTypeIndicesTokenIterator::Single(maybe_consumed) => {
+                maybe_consumed.take()
+            }
+            FileTypeIndicesTokenIterator::BitArray(bit_array_iterator) => {
+                bit_array_iterator.next()
+            }
+            FileTypeIndicesTokenIterator::Vec(vec_iterator) => {
+                vec_iterator.next()
+            }
+        }
+    }
+}
+
+pub enum FileTypeIndicesTokenRefIterator<'token> {
+    Empty,
+    Single(Option<usize>),
+    BitArray(FileTypeIndicesBitArrayIterator),
+    Vec(<&'token Vec<usize> as IntoIterator>::IntoIter),
+}
+
+impl<'token> FileTypeIndicesTokenRefIterator<'token> {
+    pub fn new(file_type_indices_token: &'token FileTypeIndicesToken) -> Self {
+        match file_type_indices_token {
+            FileTypeIndicesToken::Empty => Self::Empty,
+            FileTypeIndicesToken::Single(first_file_type_index) => {
+                Self::Single(Some(*first_file_type_index))
+            }
+            FileTypeIndicesToken::BitArray(bit_array) => Self::BitArray(
+                bit_array_into_file_type_indices_iterator(*bit_array),
+            ),
+            FileTypeIndicesToken::Vec(vec) => Self::Vec(vec.into_iter()),
+        }
+    }
+}
+
+impl<'token> Iterator for FileTypeIndicesTokenRefIterator<'token> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Empty => None,
+            Self::Single(maybe_consumed) => maybe_consumed.take(),
+            Self::BitArray(bit_array_iterator) => bit_array_iterator.next(),
+            Self::Vec(vec_iterator) => vec_iterator.next().copied(),
+        }
+    }
+}
+
+impl Globs {
+    fn unmatched() -> Globs {
+        Globs(GlobsInner::UnmatchedIgnore)
     }
 }
 
@@ -262,11 +470,11 @@ impl Types {
     /// The path is considered ignored if it matches a negated file type.
     /// If at least one file type is selected and `path` doesn't match, then
     /// the path is also considered ignored.
-    pub fn matched<'a, P: AsRef<Path>>(
-        &'a self,
+    pub fn matched<P: AsRef<Path>>(
+        &self,
         path: P,
         is_dir: bool,
-    ) -> Match<Glob<'a>> {
+    ) -> Match<Globs> {
         // File types don't apply to directories, and we can't do anything
         // if our glob set is empty.
         if is_dir || self.set.is_empty() {
@@ -277,7 +485,7 @@ impl Types {
         let name = match file_name(path.as_ref()) {
             Some(name) => name,
             None if self.has_selected => {
-                return Match::Ignore(Glob::unmatched());
+                return Match::Ignore(Globs::unmatched());
             }
             None => {
                 return Match::None;
@@ -285,22 +493,48 @@ impl Types {
         };
         let mut matches = self.matches.get_or_default().borrow_mut();
         self.set.matches_into(name, &mut *matches);
-        // The highest precedent match is the last one.
-        if let Some(&i) = matches.last() {
+        let mut file_type_indices_token_and_is_negated: Option<(
+            FileTypeIndicesToken,
+            bool,
+        )> = Default::default();
+        for &i in &*matches {
             let (isel, _) = self.glob_to_selection[i];
             let sel = &self.selections[isel];
-            let glob = Glob(GlobInner::Matched { def: sel.inner() });
-            return if sel.is_negated() {
-                Match::Ignore(glob)
+            match file_type_indices_token_and_is_negated.as_mut() {
+                None => {
+                    file_type_indices_token_and_is_negated =
+                        Some((isel.into(), sel.is_negated()));
+                }
+                Some((file_type_indices_token, is_negated)) => {
+                    if *is_negated != sel.is_negated() {
+                        panic!("Expected matching globs to be either all ignore or all whitelist");
+                    }
+                    file_type_indices_token.push(isel);
+                }
+            }
+        }
+        if let Some((file_type_indices_token, is_negated)) =
+            file_type_indices_token_and_is_negated
+        {
+            let globs = Globs(GlobsInner::Matched { file_type_indices_token });
+            return if is_negated {
+                Match::Ignore(globs)
             } else {
-                Match::Whitelist(glob)
+                Match::Whitelist(globs)
             };
         }
         if self.has_selected {
-            Match::Ignore(Glob::unmatched())
+            Match::Ignore(Globs::unmatched())
         } else {
             Match::None
         }
+    }
+
+    pub fn get_file_type_def_at_selection_index(
+        &self,
+        selection_index: usize,
+    ) -> &FileTypeDef {
+        self.selections[selection_index].inner()
     }
 }
 

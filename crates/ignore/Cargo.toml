@@ -1,8 +1,10 @@
 [package]
-name = "ignore"
-version = "0.4.20"  #:version
+name = "tree_sitter_grep_ignore"
+version = "0.4.20-dev.0"  #:version
 authors = ["Andrew Gallant <jamslam@gmail.com>"]
 description = """
+(A forked version of `ignore` used internally by `tree-sitter-grep`)
+
 A fast library for efficiently matching ignore files such as `.gitignore`
 against file paths.
 """
@@ -19,6 +21,7 @@ name = "ignore"
 bench = false
 
 [dependencies]
+bitvec = "1.0.1"
 globset = { version = "0.4.10", path = "../globset" }
 lazy_static = "1.1"
 log = "0.4.5"

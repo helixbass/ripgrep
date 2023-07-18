@@ -1,13 +1,21 @@
-use std::error;
+use std::cell::{OnceCell, RefCell};
 use std::io::{self, Write};
 use std::process;
-use std::sync::Mutex;
+use std::rc::Rc;
+use std::sync::mpsc::Receiver;
+use std::sync::{mpsc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Instant;
+use std::{error, thread};
 
-use ignore::WalkState;
+use ignore::{DirEntry, WalkParallel, WalkState};
 
 use args::Args;
+use rayon::{iter::IterBridge, prelude::*};
 use subject::Subject;
+use termcolor::{Buffer, BufferWriter};
+
+use crate::search::SearchWorker;
 
 #[macro_use]
 mod messages;
@@ -135,6 +143,22 @@ fn search(args: &Args) -> Result<bool> {
     }
 }
 
+thread_local! {
+    static SEARCHER: OnceCell<Rc<RefCell<Result<SearchWorker<Buffer>>>>> = Default::default();
+}
+pub(crate) fn get_searcher(
+    args: &Args,
+    bufwtr: &BufferWriter,
+) -> Rc<RefCell<Result<SearchWorker<Buffer>>>> {
+    SEARCHER.with(|searcher| {
+        searcher
+            .get_or_init(|| {
+                Rc::new(RefCell::new(args.search_worker(bufwtr.buffer())))
+            })
+            .clone()
+    })
+}
+
 /// The top-level entry point for multi-threaded search. The parallelism is
 /// itself achieved by the recursive directory traversal. All we need to do is
 /// feed it a worker for performing a search on each file.
@@ -152,60 +176,45 @@ fn search_parallel(args: &Args) -> Result<bool> {
     let stats = args.stats()?.map(Mutex::new);
     let matched = AtomicBool::new(false);
     let searched = AtomicBool::new(false);
-    let mut searcher_err = None;
-    args.walker_parallel()?.run(|| {
-        let bufwtr = &bufwtr;
-        let stats = &stats;
-        let matched = &matched;
-        let searched = &searched;
-        let subject_builder = &subject_builder;
-        let mut searcher = match args.search_worker(bufwtr.buffer()) {
+    into_parallel_iterator(args.walker_parallel()?).for_each(|result| {
+        let searcher = get_searcher(args, &bufwtr);
+        let mut searcher = (*searcher).borrow_mut();
+        let searcher = match searcher.as_mut() {
             Ok(searcher) => searcher,
             Err(err) => {
-                searcher_err = Some(err);
-                return Box::new(move |_| WalkState::Quit);
+                return;
             }
         };
 
-        Box::new(move |result| {
-            let subject = match subject_builder.build_from_result(result) {
-                Some(subject) => subject,
-                None => return WalkState::Continue,
-            };
-            searched.store(true, SeqCst);
-            searcher.printer().get_mut().clear();
-            let search_result = match searcher.search(&subject) {
-                Ok(search_result) => search_result,
-                Err(err) => {
-                    err_message!("{}: {}", subject.path().display(), err);
-                    return WalkState::Continue;
-                }
-            };
-            if search_result.has_match() {
-                matched.store(true, SeqCst);
-            }
-            if let Some(ref locked_stats) = *stats {
-                let mut stats = locked_stats.lock().unwrap();
-                *stats += search_result.stats().unwrap();
-            }
-            if let Err(err) = bufwtr.print(searcher.printer().get_mut()) {
-                // A broken pipe means graceful termination.
-                if err.kind() == io::ErrorKind::BrokenPipe {
-                    return WalkState::Quit;
-                }
-                // Otherwise, we continue on our merry way.
+        let subject = match subject_builder.build_from_result(result) {
+            Some(subject) => subject,
+            None => return,
+        };
+        searched.store(true, SeqCst);
+        searcher.printer().get_mut().clear();
+        let search_result = match searcher.search(&subject) {
+            Ok(search_result) => search_result,
+            Err(err) => {
                 err_message!("{}: {}", subject.path().display(), err);
+                return;
             }
-            if matched.load(SeqCst) && quit_after_match {
-                WalkState::Quit
-            } else {
-                WalkState::Continue
+        };
+        if search_result.has_match() {
+            matched.store(true, SeqCst);
+        }
+        if let Some(ref locked_stats) = stats {
+            let mut stats = locked_stats.lock().unwrap();
+            *stats += search_result.stats().unwrap();
+        }
+        if let Err(err) = bufwtr.print(searcher.printer().get_mut()) {
+            // A broken pipe means graceful termination.
+            if err.kind() == io::ErrorKind::BrokenPipe {
+                return;
             }
-        })
+            // Otherwise, we continue on our merry way.
+            err_message!("{}: {}", subject.path().display(), err);
+        }
     });
-    if let Some(err) = searcher_err.take() {
-        return Err(err);
-    }
     if args.using_default_path() && !searched.load(SeqCst) {
         eprint_nothing_searched();
     }
@@ -217,6 +226,45 @@ fn search_parallel(args: &Args) -> Result<bool> {
         let _ = searcher.print_stats(elapsed, &stats);
     }
     Ok(matched.load(SeqCst))
+}
+
+fn into_parallel_iterator(
+    walk_parallel: WalkParallel,
+) -> IterBridge<WalkParallelIterator> {
+    WalkParallelIterator::new(walk_parallel).par_bridge()
+}
+
+pub(crate) struct WalkParallelIterator {
+    receiver_iterator:
+        <Receiver<std::result::Result<DirEntry, ignore::Error>> as IntoIterator>::IntoIter,
+    _handle: JoinHandle<()>,
+}
+
+impl WalkParallelIterator {
+    pub fn new(walk_parallel: WalkParallel) -> Self {
+        let (sender, receiver) =
+            mpsc::channel::<std::result::Result<DirEntry, ignore::Error>>();
+        let handle = thread::spawn(move || {
+            walk_parallel.run(move || {
+                Box::new({
+                    let sender = sender.clone();
+                    move |entry| {
+                        sender.send(entry).unwrap();
+                        WalkState::Continue
+                    }
+                })
+            });
+        });
+        Self { receiver_iterator: receiver.into_iter(), _handle: handle }
+    }
+}
+
+impl Iterator for WalkParallelIterator {
+    type Item = std::result::Result<DirEntry, ignore::Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.receiver_iterator.next()
+    }
 }
 
 fn eprint_nothing_searched() {

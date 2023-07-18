@@ -1563,7 +1563,7 @@ impl ArgMatches {
         let threads = self.usize_of("threads")?.unwrap_or(0);
         let available =
             std::thread::available_parallelism().map_or(1, |n| n.get());
-        Ok(if threads == 0 { cmp::min(12, available) } else { threads })
+        Ok(if threads == 0 { cmp::min(2, available) } else { threads })
     }
 
     /// Builds a file type matcher from the command line flags.
